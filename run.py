@@ -21,6 +21,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -1095,32 +1096,54 @@ def prepare_case_workspace(run_dir: Path, experiment: str, case_id: str) -> Path
 
 
 def run_subprocess(command: list[str], cwd: Path, timeout: int) -> AgentRunResult:
-    """Run an external command with captured output and timeout handling."""
+    """Run an external command with captured output and timeout handling.
+
+    The child runs in its own process group so a timeout can SIGTERM
+    every descendant, not just the immediate child. Without this, a
+    grandchild that keeps the stdout pipe open (e.g. a Node.js worker
+    spawned by Claude Code) will hang ``Popen.communicate`` long past the
+    timeout while it waits for EOF that never comes.
+    """
     started = time.time()
+    proc = subprocess.Popen(
+        command,
+        cwd=str(cwd),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
     try:
-        proc = subprocess.run(
-            command,
-            cwd=str(cwd),
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-        )
+        stdout, stderr = proc.communicate(timeout=timeout)
         return AgentRunResult(
             returncode=proc.returncode,
-            stdout=proc.stdout,
-            stderr=proc.stderr,
+            stdout=stdout,
+            stderr=stderr,
             elapsed_seconds=time.time() - started,
             command=command,
         )
-    except subprocess.TimeoutExpired as error:
+    except subprocess.TimeoutExpired:
+        _terminate_process_group(proc.pid, signal.SIGTERM)
+        try:
+            stdout, stderr = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            _terminate_process_group(proc.pid, signal.SIGKILL)
+            stdout, stderr = proc.communicate()
         return AgentRunResult(
             returncode=124,
-            stdout=error.stdout or "",
-            stderr=(error.stderr or "") + f"\nTIMEOUT after {timeout}s",
+            stdout=stdout or "",
+            stderr=(stderr or "") + f"\nTIMEOUT after {timeout}s",
             elapsed_seconds=time.time() - started,
             command=command,
         )
+
+
+def _terminate_process_group(pid: int, sig: int) -> None:
+    """Best-effort signal to a child's whole process group; ignore races."""
+    try:
+        os.killpg(os.getpgid(pid), sig)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 def default_agent_command(agent: str, prompt: str, args: argparse.Namespace) -> list[str]:
@@ -1130,6 +1153,7 @@ def default_agent_command(agent: str, prompt: str, args: argparse.Namespace) -> 
         # Keep flags after the prompt so shells / wrappers do not accidentally treat
         # the next flag as the prompt body. Official usage is of the form:
         # claude -p "your prompt".
+        model_flags = ["--model", args.claude_model] if args.claude_model else []
         return [
             args.claude_bin,
             "-p",
@@ -1138,18 +1162,21 @@ def default_agent_command(agent: str, prompt: str, args: argparse.Namespace) -> 
             "text",
             "--permission-mode",
             args.claude_permission_mode,
+            *model_flags,
             *args.claude_extra_args,
         ]
     if agent == "codex":
         # `codex exec` (non-interactive) defaults to approval=never on its own.
         # The old `--ask-for-approval <policy>` flag was removed in codex CLI
         # 0.125+; passing it now causes an immediate exit with code 2.
+        model_flags = ["--model", args.codex_model] if args.codex_model else []
         return [
             args.codex_bin,
             "exec",
             "--sandbox",
             args.codex_sandbox,
             "--skip-git-repo-check",
+            *model_flags,
             *args.codex_extra_args,
             prompt,
         ]
@@ -1638,8 +1665,10 @@ def add_runner_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--claude-bin", default=os.environ.get("CLAUDE_BIN", "claude"))
     parser.add_argument("--codex-bin", default=os.environ.get("CODEX_BIN", "codex"))
     parser.add_argument("--claude-permission-mode", default=os.environ.get("CLAUDE_PERMISSION_MODE", "bypassPermissions"))
+    parser.add_argument("--claude-model", default=os.environ.get("CLAUDE_MODEL"), help="Model passed to `claude --model` (e.g. sonnet, opus). Default: CLI's own default.")
     parser.add_argument("--claude-extra-args", nargs="*", default=[], help="Extra args inserted before the Claude prompt.")
     parser.add_argument("--codex-sandbox", default=os.environ.get("CODEX_SANDBOX", "workspace-write"))
+    parser.add_argument("--codex-model", default=os.environ.get("CODEX_MODEL"), help="Model passed to `codex exec --model` (e.g. gpt-5-codex). Default: CLI's own default.")
     parser.add_argument("--codex-extra-args", nargs="*", default=[], help="Extra args inserted before the Codex prompt.")
 
 

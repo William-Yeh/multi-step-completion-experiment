@@ -140,6 +140,7 @@ per-case workspace（`experiment_1/case_01/...`）預設會在 grading 後刪除
 * `--sequential-experiments` — 序列執行三個 experiment，不平行
 * `--no-progress` — 關掉 live table
 * `--keep-workspaces` — 保留 per-case debug 檔
+* `--claude-model <name>` / `--codex-model <name>` — 指定要用的模型（預設讓各自 CLI 決定；也可用 `CLAUDE_MODEL` / `CODEX_MODEL` 環境變數）
 * `--claude-permission-mode <mode>` / `--claude-extra-args …`
 * `--codex-sandbox <mode>` / `--codex-extra-args …`
 
